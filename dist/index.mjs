@@ -4209,8 +4209,8 @@ function run(exe, args, { cwd, env = process.env, quiet = false, timeout = 20 * 
   if (result.error) throw result.error;
   return { status: result.status ?? 1, stdout: result.stdout || "", stderr: result.stderr || "" };
 }
-function requireToolchain(exe, cwd, env = process.env) {
-  const result = run(exe, ["--version"], { cwd, env, quiet: true });
+function requireToolchain(exe, cwd, env = process.env, timeout) {
+  const result = run(exe, ["--version"], { cwd, env, quiet: true, timeout });
   if (result.status !== 0 || !/Kotlin Toolchain version /.test(result.stdout)) throw new Error("Expected JetBrains Kotlin Toolchain; install it with Heapy/setup-ktc");
   return result.stdout.trim();
 }
@@ -4223,6 +4223,31 @@ function checkArguments(env) {
     ...names(env.INPUT_MODULES || "", "modules").flatMap((name) => ["--module", name]),
     ...names(env.INPUT_SKIP || "", "skip").flatMap((name) => ["--skip", name])
   ];
+}
+function commands(env, build) {
+  const platforms = names(env.INPUT_PLATFORMS || "", "platforms").flatMap((name) => ["--platform", name]);
+  const modules = names(env.INPUT_MODULES || "", "modules");
+  const moduleArgs = modules.flatMap((name) => ["--module", name]);
+  const checkArgs = checkArguments(env);
+  const result = build ? [["build", ...moduleArgs, ...platforms]] : [];
+  if (!platforms.length) return [...result, checkArgs];
+  const checks = names(env.INPUT_CHECKS || "", "checks");
+  const skip = names(env.INPUT_SKIP || "", "skip");
+  if ((!checks.length || checks.includes("tests")) && !skip.includes("tests")) {
+    result.push(["test", ...modules.flatMap((name) => ["--include-module", name]), ...platforms]);
+  }
+  if (!checks.length) {
+    result.push(["show", "checks", "--format", "plain", ...moduleArgs]);
+    result.push([
+      "check",
+      ...moduleArgs,
+      ...[.../* @__PURE__ */ new Set([...skip, "tests"])].flatMap((name) => ["--skip", name])
+    ]);
+  } else {
+    const pluginChecks = checks.filter((name) => name !== "tests" && !skip.some((skipped) => skipped === name || !skipped.includes(":") && name.split(":").at(-1) === skipped));
+    if (pluginChecks.length) result.push(["check", ...pluginChecks, ...moduleArgs]);
+  }
+  return result;
 }
 function parseReport(xml) {
   if (/<!DOCTYPE|<!ENTITY/i.test(xml)) throw new Error("DTD/entity declarations are not allowed in test reports");
@@ -4271,13 +4296,22 @@ async function check(env = process.env) {
   const cwd = await projectDirectory(env.INPUT_DIRECTORY, env);
   const build = bool(env.INPUT_BUILD ?? "true", "build");
   bool(env.INPUT_UPLOAD ?? "true", "upload-reports");
-  const args = checkArguments(env);
+  const timeoutMinutes = env.INPUT_COMMAND_TIMEOUT_MINUTES ?? "20";
+  const timeout = Number(timeoutMinutes) * 6e4;
+  if (!/^\d+$/.test(timeoutMinutes) || !Number.isSafeInteger(timeout) || timeout <= 0) {
+    throw new Error("command-timeout-minutes must be a positive integer");
+  }
+  const invocations = commands(env, build);
   const cli = await executable(cwd, env);
-  const toolchain = requireToolchain(cli, cwd, env);
+  const toolchain = requireToolchain(cli, cwd, env, timeout);
   const started = Date.now();
   let exitCode = 0;
-  if (build) exitCode = run(cli, ["build", ...names(env.INPUT_MODULES || "", "modules").flatMap((name) => ["--module", name])], { cwd, env }).status;
-  if (!exitCode) exitCode = run(cli, args, { cwd, env }).status;
+  for (const args of invocations) {
+    const result = run(cli, args, { cwd, env, timeout, quiet: args[0] === "show" });
+    exitCode = result.status;
+    if (exitCode) break;
+    if (args[0] === "show" && !names(result.stdout, "available checks").some((name) => name !== "tests")) break;
+  }
   const totals = { tests: 0, failures: 0, errors: 0, skipped: 0 };
   let reports = 0, parseErrors = 0;
   for (const file of await reportFiles(path2.join(cwd, "build", "reports"))) {
